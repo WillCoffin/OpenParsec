@@ -66,7 +66,12 @@ struct MainView: View {
 					Button(action: { showLogoutAlert = true }, label: { Image("SymbolExit").scaleEffect(x: -1) })
 						.padding()
 						.alert(isPresented: $showLogoutAlert) {
-							Alert(title: Text("Are you sure you want to logout?"), primaryButton: .destructive(Text("Logout"), action: logout), secondaryButton: .cancel(Text("Cancel")))
+							Alert(
+								title: Text("Sign out on this device?"),
+								message: Text("This clears the saved session from OpenParsec. The session token may remain valid on Parsec’s servers."),
+								primaryButton: .destructive(Text("Sign Out"), action: logout),
+								secondaryButton: .cancel(Text("Cancel"))
+							)
 						}
 //					Button(action: {
 //						if let c = controller
@@ -658,6 +663,8 @@ struct MainView: View {
 	}
 
 	func connectTo(_ who: IdentifiableHostInfo, retried: Bool = false) {
+		guard NetworkHandler.clinfo != nil else { return }
+
 		if NetworkWatcher.shared.noNetwork {
 			appNote("[connect] no network, not trying")
 			withAnimation {
@@ -780,21 +787,28 @@ struct MainView: View {
 	}
 
 	func logout() {
-		removeFromKeychain(key: GLBDataModel.shared.SessionKeyChainKey)
+		let key = GLBDataModel.shared.SessionKeyChainKey
+		let query = [kSecClass as String: kSecClassGenericPassword, kSecAttrAccount as String: key] as CFDictionary
+		let status = SecItemDelete(query)
+		guard status == errSecSuccess || status == errSecItemNotFound else {
+			baseAlertText = "Couldn’t remove your saved session. Try signing out again."
+			showBaseAlert = true
+			return
+		}
+
 		NetworkHandler.clinfo = nil
+		if isConnecting || ParsecBackgroundManager.shared.hasActiveConnection {
+			cancelConnection()
+		}
+		pollTimer?.invalidate()
+		pollTimer = nil
+		ParsecBackgroundManager.shared.reconnectPending = false
 		ParsecBackgroundManager.shared.disableAutoReconnect()
 		if let c = controller {
 			c.setView(.login)
 		}
 	}
 
-	func removeFromKeychain(key: String) {
-		let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrAccount as String: key]
-		let status = SecItemDelete(query as CFDictionary)
-		if status == errSecSuccess {
-			print("Successfully removed data from keychain.")
-		}
-	}
 }
 
 struct MainView_Previews: PreviewProvider {
