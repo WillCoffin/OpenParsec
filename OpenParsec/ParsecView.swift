@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 import ParsecSDK
 import Foundation
@@ -202,6 +203,11 @@ struct ParsecView: View {
 	@AppStorage("menuSwipeHintShown") var menuSwipeHintShown: Bool = false
 
 	@State var showKeyboard: Bool = false
+	@State private var showHeadsetControls = true
+	@State private var headsetPointerMode: HeadsetPointerMode = .click
+	private var headsetInputBlocked: Bool {
+		showSettings || showMenu || isReconnecting || connectionLost || showDCAlert || dataModel.isBlocked
+	}
 	@State var zoomEnabled: Bool = false
 	@Environment(\.verticalSizeClass) var verticalSizeClass
 
@@ -251,9 +257,15 @@ struct ParsecView: View {
 	var body: some View {
 		ZStack {
 
-			UIViewControllerWrapper(self.parsecViewController)
-				.zIndex(1)
-				.prefersPersistentSystemOverlaysHidden()
+			Group {
+				if AppPlatform.isVisionPro {
+					UIViewControllerWrapper(parsecViewController)
+				} else {
+					UIViewControllerWrapper(parsecViewController)
+						.prefersPersistentSystemOverlaysHidden()
+				}
+			}
+			.zIndex(1)
 
 			ParsecStatusBar(showMenu: $showMenu, showDCAlert: $showDCAlert, DCAlertText: $DCAlertText, parsecViewController: parsecViewController, isReconnecting: $isReconnecting, connectionLost: $connectionLost, onSilentDisconnect: { disconnect() })
 
@@ -308,7 +320,7 @@ struct ParsecView: View {
 
 			HStack(alignment: .top, spacing: 0) {
 				VStack {
-					if !hideOverlay {
+					if !hideOverlay && !AppPlatform.isVisionPro {
 						HStack {
 							Button(action: {
 								if showMenu {
@@ -331,7 +343,7 @@ struct ParsecView: View {
 							Spacer()
 						}
 					}
-					if !hideKeyboardButton {
+					if !hideKeyboardButton && !AppPlatform.isVisionPro {
 						HStack {
 							Button(action: toggleKeyboard) {
 								Image(systemName: "keyboard")
@@ -365,6 +377,17 @@ struct ParsecView: View {
 				}
 			}
 			.zIndex(2)
+
+			if AppPlatform.isVisionPro && !isReconnecting && !connectionLost {
+				headsetToolbar
+					.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+					.padding(12)
+					.zIndex(4)
+			}
+		}
+		.onChange(of: headsetPointerMode) { parsecViewController.headsetPointerMode = $0 }
+		.onChange(of: headsetInputBlocked) { blocked in
+			if AppPlatform.isVisionPro { parsecViewController.setHeadsetInputBlocked(blocked) }
 		}
 		.statusBarHidden(SettingsHandler.hideStatusBar)
 		.alert(isPresented: $showDCAlert) {
@@ -400,6 +423,42 @@ struct ParsecView: View {
 		.edgesIgnoringSafeArea(.all)
 		.overlay(SettingsView(visible: $showSettings))
 
+	}
+
+	private var headsetToolbar: some View {
+		VStack(spacing: 6) {
+			Button {
+				showHeadsetControls.toggle()
+			} label: {
+				Label(showHeadsetControls ? "Hide Controls" : "Show Controls", systemImage: "slider.horizontal.3")
+			}
+
+			if showHeadsetControls {
+				HStack(spacing: 8) {
+					Menu {
+						ForEach(HeadsetPointerMode.allCases, id: \.self) { mode in
+							Button(mode.rawValue) { headsetPointerMode = mode }
+						}
+					} label: {
+						Label(headsetPointerMode.rawValue, systemImage: "cursorarrow")
+					}
+					Button(showKeyboard ? "Hide Keyboard" : "Keyboard", action: toggleKeyboard)
+					Button("Fit / Zoom") { parsecViewController.toggleHeadsetZoom() }
+				}
+				HStack(spacing: 8) {
+					Menu("Shortcuts") {
+						Button("Escape") { parsecViewController.sendHeadsetShortcut([41]) }
+						Button("Alt-Tab") { parsecViewController.sendHeadsetShortcut([226, 43]) }
+						Button("Ctrl-Alt-Delete") { parsecViewController.sendHeadsetShortcut([224, 226, 76]) }
+					}
+					Button("Settings", action: openSettings)
+					Button("Disconnect", role: .destructive) { disconnect() }
+				}
+			}
+		}
+		.buttonStyle(.bordered)
+		.padding(8)
+		.background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
 	}
 
 	var menuPanel: some View {
@@ -613,6 +672,11 @@ struct ParsecView: View {
 			}
 		}
 
+		if AppPlatform.isVisionPro {
+			let mode = $headsetPointerMode
+			parsecViewController.onHeadsetRightClick = { mode.wrappedValue = .click }
+			parsecViewController.setHeadsetInputBlocked(headsetInputBlocked)
+		}
 		parsecViewController.setKeyboardVisible(showKeyboard)
 	}
 
@@ -681,6 +745,7 @@ struct ParsecView: View {
 	}
 
 	func offerHint(always: Bool = false) {
+		guard !AppPlatform.isVisionPro else { return }
 		let menu = hideOverlay && (always || !menuSwipeHintShown)
 		let keyboard = hideKeyboardButton && (always || !keyboardHintShown)
 		guard menu || keyboard else { return }

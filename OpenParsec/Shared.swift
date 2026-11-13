@@ -5,6 +5,15 @@ import os
 
 var appScheme: ColorScheme = .dark
 
+enum AppPlatform {
+	static let isVisionPro: Bool = {
+		if #available(iOS 26.1, *) {
+			return ProcessInfo.processInfo.isiOSAppOnVision
+		}
+		return false
+	}()
+}
+
 struct GLBData {
 	let SessionKeyChainKey = "OPStoredAuthData"
 }

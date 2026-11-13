@@ -24,6 +24,14 @@ You can toggle if you want to use 2 fingers to scroll or zoom in the overlay men
 ## Mouse & keyboard
 USB mouse & keyboard are supported. 
 
+## Apple Vision Pro compatibility preview
+
+The existing iPad target includes a headset input path for visionOS 26.1 or later. Pair a physical Vision Pro with Xcode, enable Developer Mode, and choose the Vision Pro **Designed for iPad** destination for the `OpenParsec` scheme. Use automatic development signing and your own bundle identifier. Xcode 27.2 requires an iOS deployment target of at least 15.0. [Apple’s pairing instructions](https://developer.apple.com/documentation/xcode/pairing-your-devices-with-your-mac)
+
+During a stream, use **Show Controls** to open the keyboard, switch between fit and zoom, send a shortcut, or disconnect. **Click** uses the tap location, **Right Click** applies to one tap, and **Drag**, **Scroll**, and **Precision** change how a pinch-drag behaves. Select **Click** to exit a mode. Precision uses the current remote cursor as its starting point. Software keyboard text is limited to characters supported by the existing remote key mapping.
+
+The signed iPad build has been installed on physical iPad hardware. The Vision Pro simulator rejected the x86_64 build and the bundled SDK has no arm64 simulator slice. Physical headset testing is pending. Use a dedicated test account and a host you control to verify both hands-only and Bluetooth input, window resizing, a 30-minute stream, and recovery after sleep or network loss. Record the headset OS, host OS, accessories, and any shortcuts intercepted by the system.
+
 ## Game Controllers
 When streaming, press any trigger button in your controller and parsec will recognize it. Make sure to configure the host properly (install virtual USB driver etc.) before using game controllers.
 

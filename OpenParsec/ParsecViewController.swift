@@ -1,5 +1,6 @@
 import Foundation
 import UIKit
+import GameController
 import ParsecSDK
 import QuartzCore
 import os
@@ -92,8 +93,24 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate, ParsecTouchI
 	var lastLaidOutWidth: CGFloat = 0
 	var lastLaidOutHeight: CGFloat = 0
 
+	var headsetPointerMode: HeadsetPointerMode = .click {
+		didSet {
+			if oldValue != headsetPointerMode { finishHeadsetPan() }
+		}
+	}
+	var onHeadsetRightClick: (() -> Void)?
+	private let headsetHardwareInputView = UIView(frame: .zero)
+	private var headsetInputBlocked = false
+	private var headsetDragging = false
+	private var headsetPanMode: HeadsetPointerMode?
+	private var headsetPanRemainder = CGPoint.zero
+	private var headsetWheelActive = false
+	private var headsetScrollRemainder = CGPoint.zero
+	private var headsetTextQueue: [String] = []
+	private var headsetTextWork: DispatchWorkItem?
+
 	override var prefersPointerLocked: Bool {
-		return true
+		return !AppPlatform.isVisionPro
 	}
 
 	override var prefersHomeIndicatorAutoHidden: Bool {
@@ -104,7 +121,7 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate, ParsecTouchI
 		super.init(nibName: nil, bundle: nil)
 
 		let update: () -> Void = { [weak self] in self?.updateImage() }
-		let metal = SettingsHandler.renderer == .metal ? ParsecMetalViewController(viewController: self, updateImage: update) : nil
+		let metal = AppPlatform.isVisionPro || SettingsHandler.renderer == .metal ? ParsecMetalViewController(viewController: self, updateImage: update) : nil
 		if let metal = metal, metal.metalRenderer != nil {
 			self.glkView = metal
 			CParsec.runningRenderer = .metal
@@ -179,7 +196,7 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate, ParsecTouchI
 			// While dragging, the touch handler owns the cursor position and viewport (smooth,
 			// input-driven). When idle, follow the host's reported cursor so host- or keyboard-
 			// driven moves are reflected and any prediction drift is corrected.
-			if !isDragging && !clickHoldActive && !cursorMomentumActive {
+			if !isDragging && !clickHoldActive && !cursorMomentumActive && !headsetDragging && headsetPanMode != .precision {
 				let fingerSet = SettingsHandler.cursorMode == .direct
 					&& abs(cursorContentPos.x - CGFloat(currentMouseX)) < 1
 					&& abs(cursorContentPos.y - CGFloat(currentMouseY)) < 1
@@ -267,12 +284,25 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate, ParsecTouchI
 
 		setNeedsUpdateOfPrefersPointerLocked()
 
-		let pointerInteraction = UIPointerInteraction(delegate: self)
-		view.addInteraction(pointerInteraction)
+		if !AppPlatform.isVisionPro {
+			let pointerInteraction = UIPointerInteraction(delegate: self)
+			view.addInteraction(pointerInteraction)
+		}
 
 		view.isMultipleTouchEnabled = true
 		view.isUserInteractionEnabled = true
 
+		if AppPlatform.isVisionPro {
+			touchOverlay.inputDelegate = nil
+			installHeadsetGestures()
+		} else {
+			installTouchscreenGestures()
+		}
+
+		registerInputNotifications()
+	}
+
+	private func installTouchscreenGestures() {
 		// All gestures (cursor, pinch-zoom, two-finger scroll) are handled in the
 		// ParsecTouchInputDelegate methods below, driven by touchOverlay's raw touches.
 
@@ -312,7 +342,9 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate, ParsecTouchI
 
 		menuEdgeSwipe = addMenuEdgeSwipe(.left)
 		menuEdgeSwipeRight = addMenuEdgeSwipe(.right)
+	}
 
+	private func registerInputNotifications() {
 		NotificationCenter.default.addObserver(
 			self,
 			selector: #selector(keyboardWillShow),
@@ -367,6 +399,11 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate, ParsecTouchI
 
 	override func viewDidLayoutSubviews() {
 		super.viewDidLayoutSubviews()
+		if AppPlatform.isVisionPro, scrollView != nil, scrollView.zoomScale > 1,
+		   view.bounds.size != CGSize(width: lastLaidOutWidth, height: lastLaidOutHeight) {
+			scrollView.setZoomScale(1, animated: false)
+			scrollView.setContentOffset(.zero, animated: false)
+		}
 		// glkView/contentView get sized from possibly-stale bounds in viewDidLoad and have no
 		// autoresizing, so the stream renders in a corner until a rotation re-applies the size.
 		// re-apply once layout settles; skip while zoomed so we dont stomp pan/zoom.
@@ -389,7 +426,7 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate, ParsecTouchI
 			parent.setChildForHomeIndicatorAutoHidden(self)
 			parent.setChildViewControllerForPointerLock(self)
 		}
-		if keyboardVisible {
+		if keyboardVisible || AppPlatform.isVisionPro {
 			becomeFirstResponder()
 		}
 		// (Pinch-to-zoom is driven manually via touchOverlay; the scroll view's pinch stays off.)
@@ -397,6 +434,7 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate, ParsecTouchI
 
 	override func viewWillDisappear(_ animated: Bool) {
 		super.viewWillDisappear(animated)
+		if AppPlatform.isVisionPro { releaseHeadsetInput() }
 		UIApplication.shared.isIdleTimerDisabled = false
 		stopMomentum()
 		if let parent = parent {
@@ -415,6 +453,7 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate, ParsecTouchI
 	private var altKeyHeld = false
 
 	override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+		guard !AppPlatform.isVisionPro || acceptsHeadsetInput else { return }
 		for press in presses {
 			guard let key = press.key else { continue }
 
@@ -444,6 +483,7 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate, ParsecTouchI
 	}
 
 	override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+		guard !AppPlatform.isVisionPro || acceptsHeadsetInput else { return }
 		for press in presses {
 			guard let key = press.key else { continue }
 
@@ -492,6 +532,10 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate, ParsecTouchI
 				self.repeatTimer = Timer.scheduledTimer(withTimeInterval: 0.033, repeats: true) { [weak self] _ in
 					MainActor.assumeIsolated {
 						guard let self = self else { return }
+						guard !AppPlatform.isVisionPro || self.acceptsHeadsetInput else {
+							self.releaseHeadsetInput()
+							return
+						}
 						CParsec.sendKeyboardMessage(keyCode: UInt32(self.repeatKeyCode), pressed: false)
 						CParsec.sendKeyboardMessage(keyCode: UInt32(self.repeatKeyCode), pressed: true)
 					}
@@ -524,6 +568,7 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate, ParsecTouchI
 	}
 
 	@objc func keyboardWillShow(notification: NSNotification) {
+		if AppPlatform.isVisionPro && !keyboardVisible { return }
 		if let keyboardFrame = (notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue {
 			let keyboardFrameInView = view.convert(keyboardFrame, from: nil)
 			let scrollFrameInView = scrollView.convert(scrollView.bounds, to: view)
@@ -789,7 +834,10 @@ extension ParsecViewController: UIGestureRecognizerDelegate {
 		}
 	}
 
-	@objc private func appWillResignActive() { flushAllTouches() }
+	@objc private func appWillResignActive() {
+		flushAllTouches()
+		if AppPlatform.isVisionPro { releaseHeadsetInput() }
+	}
 
 	// Drop all touch state and release any held button so nothing sticks when backgrounded.
 	private func flushAllTouches() {
@@ -1331,15 +1379,31 @@ extension ParsecViewController: UIKeyInput, UITextInputTraits {
 	}
 
 	func insertText(_ text: String) {
-		CParsec.sendVirtualKeyboardInput(text: text)
+		guard !AppPlatform.isVisionPro || acceptsHeadsetInput else { return }
+		if AppPlatform.isVisionPro {
+			enqueueHeadsetText(text.map { String($0) })
+		} else {
+			CParsec.sendVirtualKeyboardInput(text: text)
+		}
 	}
 
 	func deleteBackward() {
-		CParsec.sendVirtualKeyboardInput(text: "BACKSPACE")
+		guard !AppPlatform.isVisionPro || acceptsHeadsetInput else { return }
+		if AppPlatform.isVisionPro {
+			enqueueHeadsetText(["BACKSPACE"])
+		} else {
+			CParsec.sendVirtualKeyboardInput(text: "BACKSPACE")
+		}
 	}
 
     // copied from moonlight https://github.com/moonlight-stream/moonlight-ios/blob/022352c1667788d8626b659d984a290aa5c25e17/Limelight/Input/StreamView.m#L393
+	override var inputView: UIView? {
+		if AppPlatform.isVisionPro && !keyboardVisible { return headsetHardwareInputView }
+		return super.inputView
+	}
+
 	override var inputAccessoryView: UIView? {
+		if AppPlatform.isVisionPro { return nil }
 
 		if let keyboardAccessoriesView {
 			return keyboardAccessoriesView
@@ -1523,6 +1587,14 @@ extension ParsecViewController: UIKeyInput, UITextInputTraits {
     // 4. Do NOT simplify this to a synchronous call, or it will fail in some race conditions.
 	func setKeyboardVisible(_ visible: Bool) {
 		keyboardVisible = visible
+		if AppPlatform.isVisionPro {
+			DispatchQueue.main.async { [weak self] in
+				guard let self, self.viewIfLoaded?.window != nil else { return }
+				self.reloadInputViews()
+				self.becomeFirstResponder()
+			}
+			return
+		}
 		if visible {
             DispatchQueue.main.async {
                 self.reloadInputViews()
@@ -1537,6 +1609,224 @@ extension ParsecViewController: UIKeyInput, UITextInputTraits {
 		}
 	}
 
+}
+
+enum HeadsetPointerMode: String, CaseIterable {
+	case click = "Click"
+	case rightClick = "Right Click"
+	case drag = "Drag"
+	case scroll = "Scroll"
+	case precision = "Precision"
+}
+
+extension ParsecViewController {
+	var acceptsHeadsetInput: Bool {
+		guard let window = viewIfLoaded?.window else { return false }
+		return !headsetInputBlocked && window.isKeyWindow
+			&& window.windowScene?.activationState == .foregroundActive
+			&& ParsecBackgroundManager.shared.hasActiveConnection
+	}
+
+	func setHeadsetInputBlocked(_ blocked: Bool) {
+		guard headsetInputBlocked != blocked else { return }
+		headsetInputBlocked = blocked
+		if blocked { releaseHeadsetInput() }
+	}
+
+	private func installHeadsetGestures() {
+		let primaryTap = UITapGestureRecognizer(target: self, action: #selector(headsetTap))
+		let secondaryTap = UITapGestureRecognizer(target: self, action: #selector(headsetTap))
+		secondaryTap.buttonMaskRequired = .secondary
+		secondaryTap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+
+		let pan = UIPanGestureRecognizer(target: self, action: #selector(headsetPan))
+		pan.maximumNumberOfTouches = 1
+		primaryTap.require(toFail: pan)
+		let wheel = UIPanGestureRecognizer(target: self, action: #selector(headsetWheel))
+		wheel.allowedTouchTypes = []
+		wheel.allowedScrollTypesMask = .all
+		let hover = UIHoverGestureRecognizer(target: self, action: #selector(headsetHover))
+		hover.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+		for gesture in [primaryTap, secondaryTap, pan, wheel, hover] as [UIGestureRecognizer] {
+			touchOverlay.addGestureRecognizer(gesture)
+		}
+
+		let center = NotificationCenter.default
+		center.addObserver(self, selector: #selector(headsetWindowResigned(_:)), name: UIWindow.didResignKeyNotification, object: nil)
+		center.addObserver(self, selector: #selector(headsetAccessoryDisconnected), name: .GCMouseDidDisconnect, object: nil)
+		center.addObserver(self, selector: #selector(headsetAccessoryDisconnected), name: .GCKeyboardDidDisconnect, object: nil)
+	}
+
+	@objc private func headsetWindowResigned(_ notification: Notification) {
+		guard let window = notification.object as? UIWindow, window === viewIfLoaded?.window else { return }
+		releaseHeadsetInput()
+	}
+
+	@objc private func headsetAccessoryDisconnected() {
+		DispatchQueue.main.async { [weak self] in self?.releaseHeadsetInput() }
+	}
+
+	private func releaseHeadsetInput() {
+		finishHeadsetPan()
+		headsetWheelActive = false
+		headsetTextWork?.cancel()
+		headsetTextWork = nil
+		headsetTextQueue.removeAll()
+		resetKeyState()
+		clearToolbarModifiers(sendToHost: false)
+		if ParsecBackgroundManager.shared.hasActiveConnection { CParsec.sendReleaseMessage() }
+	}
+
+	private func headsetVideoRect() -> CGRect {
+		let size = CGSize(width: CGFloat(CParsec.hostWidth), height: CGFloat(CParsec.hostHeight))
+		guard size.width > 0, size.height > 0 else { return .null }
+		let bounds = contentView.bounds
+		let scale = min(bounds.width / size.width, bounds.height / size.height)
+		let width = size.width * scale
+		let height = size.height * scale
+		return CGRect(x: bounds.midX - width / 2, y: bounds.midY - height / 2, width: width, height: height)
+	}
+
+	private func moveHeadsetCursor(to point: CGPoint) {
+		cursorContentPos = point
+		CParsec.sendMousePosition(Int32(point.x), Int32(point.y))
+		positionCursorOverlay()
+	}
+
+	@objc private func headsetTap(_ gesture: UITapGestureRecognizer) {
+		guard acceptsHeadsetInput else { return }
+		let point = gesture.location(in: contentView)
+		guard headsetVideoRect().contains(point) else { return }
+		if !isFirstResponder { becomeFirstResponder() }
+		let secondary = gesture.buttonMaskRequired == .secondary
+		let button = secondary || headsetPointerMode == .rightClick ? MOUSE_R : MOUSE_L
+		if headsetPointerMode != .precision || secondary { moveHeadsetCursor(to: point) }
+		CParsec.sendMouseClickMessage(button, true)
+		CParsec.sendMouseClickMessage(button, false)
+		if headsetPointerMode == .rightClick {
+			headsetPointerMode = .click
+			onHeadsetRightClick?()
+		}
+	}
+
+	@objc private func headsetHover(_ gesture: UIHoverGestureRecognizer) {
+		guard acceptsHeadsetInput, !headsetDragging, headsetPointerMode != .precision,
+			  gesture.state == .began || gesture.state == .changed else { return }
+		let point = gesture.location(in: contentView)
+		guard headsetVideoRect().contains(point) else { return }
+		moveHeadsetCursor(to: point)
+	}
+
+	@objc private func headsetPan(_ gesture: UIPanGestureRecognizer) {
+		guard acceptsHeadsetInput else {
+			finishHeadsetPan()
+			return
+		}
+		let delta = gesture.translation(in: contentView)
+		gesture.setTranslation(.zero, in: contentView)
+		let point = gesture.location(in: contentView)
+		let video = headsetVideoRect()
+		switch gesture.state {
+		case .began:
+			let start = CGPoint(x: point.x - delta.x, y: point.y - delta.y)
+			guard video.contains(start) else { return }
+			let isPrimaryDrag = headsetPointerMode == .click && gesture.buttonMask.contains(.primary)
+			let mode = isPrimaryDrag ? .drag : headsetPointerMode
+			headsetPanMode = mode
+			if mode == .drag {
+				moveHeadsetCursor(to: start)
+				CParsec.sendMouseClickMessage(MOUSE_L, true)
+				headsetDragging = true
+			}
+		case .changed:
+			switch headsetPanMode {
+			case .scroll:
+				forwardHeadsetWheel(delta, remainder: &headsetPanRemainder)
+			case .precision where !video.isNull:
+				let precision = CGPoint(x: cursorContentPos.x + delta.x * 0.25, y: cursorContentPos.y + delta.y * 0.25)
+				moveHeadsetCursor(to: CGPoint(x: min(max(video.minX, precision.x), video.maxX),
+											 y: min(max(video.minY, precision.y), video.maxY)))
+			default:
+				if headsetDragging && video.contains(point) { moveHeadsetCursor(to: point) }
+			}
+		case .ended, .cancelled, .failed:
+			finishHeadsetPan()
+		default:
+			break
+		}
+	}
+
+	@objc private func headsetWheel(_ gesture: UIPanGestureRecognizer) {
+		switch gesture.state {
+		case .began:
+			headsetWheelActive = acceptsHeadsetInput && headsetVideoRect().contains(gesture.location(in: contentView))
+			headsetScrollRemainder = .zero
+		case .changed:
+			if acceptsHeadsetInput && headsetWheelActive {
+				forwardHeadsetWheel(gesture.translation(in: contentView), remainder: &headsetScrollRemainder)
+			}
+		default:
+			headsetWheelActive = false
+		}
+		gesture.setTranslation(.zero, in: contentView)
+	}
+
+	private func forwardHeadsetWheel(_ delta: CGPoint, remainder: inout CGPoint) {
+		let direction = CGFloat(scrollWheelSpeed) * (SettingsHandler.reverseScrollDirection ? 1 : -1)
+		remainder.x += delta.x * direction
+		remainder.y += delta.y * direction
+		let x = Int32(remainder.x)
+		let y = Int32(remainder.y)
+		remainder.x -= CGFloat(x)
+		remainder.y -= CGFloat(y)
+		if x != 0 || y != 0 { CParsec.sendWheelMsg(x: x, y: y) }
+	}
+
+	private func finishHeadsetPan() {
+		if headsetDragging { CParsec.sendMouseClickMessage(MOUSE_L, false) }
+		headsetDragging = false
+		headsetPanMode = nil
+		headsetPanRemainder = .zero
+	}
+
+	func toggleHeadsetZoom() {
+		guard isViewLoaded else { return }
+		let scale: CGFloat = scrollView.zoomScale > 1 ? 1 : 2
+		let anchor = view.convert(cursorContentPos, from: contentView)
+		let target = CGPoint(x: cursorContentPos.x * scale - anchor.x, y: cursorContentPos.y * scale - anchor.y)
+		scrollView.setZoomScale(scale, animated: false)
+		let maxX = max(0, scrollView.contentSize.width - scrollView.bounds.width)
+		let maxY = max(0, scrollView.contentSize.height - scrollView.bounds.height)
+		scrollView.setContentOffset(CGPoint(x: min(max(0, target.x), maxX), y: min(max(0, target.y), maxY)), animated: false)
+		updateRenderScale()
+		positionCursorOverlay()
+	}
+
+	private func enqueueHeadsetText(_ keys: [String]) {
+		headsetTextQueue.append(contentsOf: keys)
+		if headsetTextWork == nil { sendNextHeadsetTextKey() }
+	}
+
+	private func sendNextHeadsetTextKey() {
+		headsetTextWork = nil
+		guard acceptsHeadsetInput else {
+			headsetTextQueue.removeAll()
+			return
+		}
+		guard !headsetTextQueue.isEmpty else { return }
+		CParsec.sendVirtualKeyboardInput(text: headsetTextQueue.removeFirst())
+		// The SDK bridge sends the key-up after 20 ms.
+		let next = DispatchWorkItem { [weak self] in self?.sendNextHeadsetTextKey() }
+		headsetTextWork = next
+		DispatchQueue.main.asyncAfter(deadline: .now() + 0.03, execute: next)
+	}
+
+	func sendHeadsetShortcut(_ keys: [UInt32]) {
+		guard acceptsHeadsetInput else { return }
+		releaseHeadsetInput()
+		for key in keys { CParsec.sendKeyboardMessage(keyCode: key, pressed: true) }
+		for key in keys.reversed() { CParsec.sendKeyboardMessage(keyCode: key, pressed: false) }
+	}
 }
 
 protocol ParsecTouchInputDelegate: AnyObject {

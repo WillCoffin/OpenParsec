@@ -82,6 +82,8 @@ class GamepadController {
 	}
 
 	func registerMouseHandler() {
+		// Headset pointing devices use window-local UIKit events.
+		guard !AppPlatform.isVisionPro else { return }
 		for mouse in GCMouse.mice() {
 			mice.insert(mouse)
 			mouse.mouseInput?.leftButton.pressedChangedHandler = {(_: GCControllerButtonInput, _: Float, pressed: Bool) in
