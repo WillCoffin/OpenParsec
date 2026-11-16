@@ -100,6 +100,7 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate, ParsecTouchI
 	}
 	var onHeadsetRightClick: (() -> Void)?
 	private let headsetHardwareInputView = UIView(frame: .zero)
+	private let headsetKeyboardField = HeadsetKeyboardField(frame: .zero)
 	private var headsetInputBlocked = false
 	private var headsetDragging = false
 	private var headsetPanMode: HeadsetPointerMode?
@@ -434,7 +435,10 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate, ParsecTouchI
 
 	override func viewWillDisappear(_ animated: Bool) {
 		super.viewWillDisappear(animated)
-		if AppPlatform.isVisionPro { releaseHeadsetInput() }
+		if AppPlatform.isVisionPro {
+			headsetKeyboardField.resignFirstResponder()
+			releaseHeadsetInput()
+		}
 		UIApplication.shared.isIdleTimerDisabled = false
 		stopMomentum()
 		if let parent = parent {
@@ -568,7 +572,7 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate, ParsecTouchI
 	}
 
 	@objc func keyboardWillShow(notification: NSNotification) {
-		if AppPlatform.isVisionPro && !keyboardVisible { return }
+		if AppPlatform.isVisionPro { return }
 		if let keyboardFrame = (notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue {
 			let keyboardFrameInView = view.convert(keyboardFrame, from: nil)
 			let scrollFrameInView = scrollView.convert(scrollView.bounds, to: view)
@@ -686,6 +690,7 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate, ParsecTouchI
 	}
 
 	@objc func keyboardWillHide(notification: NSNotification) {
+		if AppPlatform.isVisionPro { return }
 		keyboardHeight = 0.0
         keyboardVisible = false
 		keyboardCoversPicture = false
@@ -1398,7 +1403,7 @@ extension ParsecViewController: UIKeyInput, UITextInputTraits {
 
     // copied from moonlight https://github.com/moonlight-stream/moonlight-ios/blob/022352c1667788d8626b659d984a290aa5c25e17/Limelight/Input/StreamView.m#L393
 	override var inputView: UIView? {
-		if AppPlatform.isVisionPro && !keyboardVisible { return headsetHardwareInputView }
+		if AppPlatform.isVisionPro { return headsetHardwareInputView }
 		return super.inputView
 	}
 
@@ -1586,15 +1591,19 @@ extension ParsecViewController: UIKeyInput, UITextInputTraits {
     // 3. call becomeFirstResponder().
     // 4. Do NOT simplify this to a synchronous call, or it will fail in some race conditions.
 	func setKeyboardVisible(_ visible: Bool) {
-		keyboardVisible = visible
 		if AppPlatform.isVisionPro {
-			DispatchQueue.main.async { [weak self] in
-				guard let self, self.viewIfLoaded?.window != nil else { return }
-				self.reloadInputViews()
-				self.becomeFirstResponder()
+			if visible {
+				guard viewIfLoaded?.window != nil, headsetKeyboardField.becomeFirstResponder() else {
+					onKeyboardVisibilityChanged?(false)
+					return
+				}
+			} else if headsetKeyboardField.isFirstResponder {
+				headsetKeyboardField.resignFirstResponder()
+				becomeFirstResponder()
 			}
 			return
 		}
+		keyboardVisible = visible
 		if visible {
             DispatchQueue.main.async {
                 self.reloadInputViews()
@@ -1634,6 +1643,20 @@ extension ParsecViewController {
 	}
 
 	private func installHeadsetGestures() {
+		// A real text field keeps the system keyboard attached to an editable view.
+		headsetKeyboardField.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
+		headsetKeyboardField.textColor = .clear
+		headsetKeyboardField.tintColor = .clear
+		headsetKeyboardField.accessibilityElementsHidden = true
+		headsetKeyboardField.keyboardType = .asciiCapable
+		headsetKeyboardField.autocorrectionType = .no
+		headsetKeyboardField.autocapitalizationType = .none
+		headsetKeyboardField.smartQuotesType = .no
+		headsetKeyboardField.smartDashesType = .no
+		headsetKeyboardField.delegate = self
+		headsetKeyboardField.onDelete = { [weak self] in self?.queueHeadsetKeyboardInput(["BACKSPACE"]) }
+		view.insertSubview(headsetKeyboardField, belowSubview: touchOverlay)
+
 		let primaryTap = UITapGestureRecognizer(target: self, action: #selector(headsetTap))
 		let secondaryTap = UITapGestureRecognizer(target: self, action: #selector(headsetTap))
 		secondaryTap.buttonMaskRequired = .secondary
@@ -1697,7 +1720,7 @@ extension ParsecViewController {
 		guard acceptsHeadsetInput else { return }
 		let point = gesture.location(in: contentView)
 		guard headsetVideoRect().contains(point) else { return }
-		if !isFirstResponder { becomeFirstResponder() }
+		if !isFirstResponder && !headsetKeyboardField.isFirstResponder { becomeFirstResponder() }
 		let secondary = gesture.buttonMaskRequired == .secondary
 		let button = secondary || headsetPointerMode == .rightClick ? MOUSE_R : MOUSE_L
 		if headsetPointerMode != .precision || secondary { moveHeadsetCursor(to: point) }
@@ -1809,7 +1832,7 @@ extension ParsecViewController {
 
 	private func sendNextHeadsetTextKey() {
 		headsetTextWork = nil
-		guard acceptsHeadsetInput else {
+		guard acceptsHeadsetInput || acceptsHeadsetKeyboardInput else {
 			headsetTextQueue.removeAll()
 			return
 		}
@@ -1826,6 +1849,45 @@ extension ParsecViewController {
 		releaseHeadsetInput()
 		for key in keys { CParsec.sendKeyboardMessage(keyCode: key, pressed: true) }
 		for key in keys.reversed() { CParsec.sendKeyboardMessage(keyCode: key, pressed: false) }
+	}
+}
+
+extension ParsecViewController: UITextFieldDelegate {
+	private var acceptsHeadsetKeyboardInput: Bool {
+		!headsetInputBlocked && headsetKeyboardField.isFirstResponder
+			&& viewIfLoaded?.window?.windowScene?.activationState == .foregroundActive
+			&& ParsecBackgroundManager.shared.hasActiveConnection
+	}
+
+	private func queueHeadsetKeyboardInput(_ keys: [String]) {
+		guard acceptsHeadsetKeyboardInput else { return }
+		enqueueHeadsetText(keys)
+	}
+
+	func textFieldDidBeginEditing(_ textField: UITextField) {
+		onKeyboardVisibilityChanged?(true)
+	}
+
+	func textFieldDidEndEditing(_ textField: UITextField) {
+		onKeyboardVisibilityChanged?(false)
+	}
+
+	func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+		queueHeadsetKeyboardInput(["\n"])
+		return false
+	}
+
+	func textField(_ textField: UITextField, shouldChangeCharactersIn range: NSRange, replacementString string: String) -> Bool {
+		queueHeadsetKeyboardInput(string.map { String($0) })
+		return false
+	}
+}
+
+private final class HeadsetKeyboardField: UITextField {
+	var onDelete: (() -> Void)?
+
+	override func deleteBackward() {
+		onDelete?()
 	}
 }
 

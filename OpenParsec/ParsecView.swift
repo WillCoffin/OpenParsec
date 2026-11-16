@@ -254,7 +254,7 @@ struct ParsecView: View {
     // 'onAppear' is a good place, or inside the init of ParsecSession if possible (but it doesn't have access to binding).
     // Let's use onAppear/post.
 
-	var body: some View {
+	private var streamContent: some View {
 		ZStack {
 
 			Group {
@@ -378,12 +378,16 @@ struct ParsecView: View {
 			}
 			.zIndex(2)
 
-			if AppPlatform.isVisionPro && !isReconnecting && !connectionLost {
+		}
+	}
+
+	var body: some View {
+		VStack(spacing: 0) {
+			if AppPlatform.isVisionPro {
 				headsetToolbar
-					.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-					.padding(12)
-					.zIndex(4)
+					.disabled(isReconnecting || connectionLost)
 			}
+			streamContent
 		}
 		.onChange(of: headsetPointerMode) { parsecViewController.headsetPointerMode = $0 }
 		.onChange(of: headsetInputBlocked) { blocked in
@@ -426,39 +430,45 @@ struct ParsecView: View {
 	}
 
 	private var headsetToolbar: some View {
-		VStack(spacing: 6) {
+		HStack(spacing: 0) {
 			Button {
 				showHeadsetControls.toggle()
 			} label: {
-				Label(showHeadsetControls ? "Hide Controls" : "Show Controls", systemImage: "slider.horizontal.3")
+				Image(systemName: "slider.horizontal.3")
+					.accessibilityLabel(showHeadsetControls ? "Hide Controls" : "Show Controls")
 			}
+			.padding(.horizontal, 8)
 
 			if showHeadsetControls {
-				HStack(spacing: 8) {
-					Menu {
-						ForEach(HeadsetPointerMode.allCases, id: \.self) { mode in
-							Button(mode.rawValue) { headsetPointerMode = mode }
+				ScrollView(.horizontal, showsIndicators: false) {
+					HStack(spacing: 8) {
+						Menu {
+							ForEach(HeadsetPointerMode.allCases, id: \.self) { mode in
+								Button(mode.rawValue) { headsetPointerMode = mode }
+							}
+						} label: {
+							Label(headsetPointerMode.rawValue, systemImage: "cursorarrow")
 						}
-					} label: {
-						Label(headsetPointerMode.rawValue, systemImage: "cursorarrow")
+						Button(showKeyboard ? "Hide Keyboard" : "Keyboard", action: toggleKeyboard)
+						Button("Fit / Zoom") { parsecViewController.toggleHeadsetZoom() }
+						Menu("Shortcuts") {
+							Button("Escape") { parsecViewController.sendHeadsetShortcut([41]) }
+							Button("Alt-Tab") { parsecViewController.sendHeadsetShortcut([226, 43]) }
+							Button("Ctrl-Alt-Delete") { parsecViewController.sendHeadsetShortcut([224, 226, 76]) }
+						}
+						Button("Settings", action: openSettings)
+						Button("Disconnect", role: .destructive) { disconnect() }
 					}
-					Button(showKeyboard ? "Hide Keyboard" : "Keyboard", action: toggleKeyboard)
-					Button("Fit / Zoom") { parsecViewController.toggleHeadsetZoom() }
-				}
-				HStack(spacing: 8) {
-					Menu("Shortcuts") {
-						Button("Escape") { parsecViewController.sendHeadsetShortcut([41]) }
-						Button("Alt-Tab") { parsecViewController.sendHeadsetShortcut([226, 43]) }
-						Button("Ctrl-Alt-Delete") { parsecViewController.sendHeadsetShortcut([224, 226, 76]) }
-					}
-					Button("Settings", action: openSettings)
-					Button("Disconnect", role: .destructive) { disconnect() }
+					.fixedSize(horizontal: true, vertical: false)
+					.padding(.trailing, 8)
 				}
 			}
+
+			if !showHeadsetControls { Spacer(minLength: 0) }
 		}
 		.buttonStyle(.bordered)
-		.padding(8)
-		.background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+		.frame(height: 48)
+		.background(.regularMaterial)
 	}
 
 	var menuPanel: some View {
